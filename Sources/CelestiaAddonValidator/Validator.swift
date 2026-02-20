@@ -1,6 +1,10 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 import OpenCloudKit
 import ZIPFoundation
+import CelestiaCatalogParser
 
 public enum ValidatorError: Error {
     case noIDOrIncorrectIDProvidedForRemoval
@@ -11,6 +15,12 @@ public enum ValidatorError: Error {
     case emptyResult
     case fileManager
     case unzipping
+    case cloudKit(error: Error)
+    case incorrectRecordFieldType
+    case network
+    case badDemoObject(supportedPaths: [String])
+    case badType(type: String)
+    case changeTypeOfExisting
 }
 
 extension ValidatorError: LocalizedError {
@@ -32,6 +42,18 @@ extension ValidatorError: LocalizedError {
             return "Rich description should be empty when remove_rich_description is on"
         case .richDescriptionRemovalOnCreate:
             return "remove_rich_description should not be on when creating an item"
+        case let .cloudKit(error):
+            return "CloudKit error: \(error)"
+        case .incorrectRecordFieldType:
+            return "Incorrect record field type found"
+        case .network:
+            return "Network error"
+        case let .badDemoObject(supportedPaths):
+            return "Bad demo object name, should be one of \(supportedPaths)"
+        case let .badType(type):
+            return "Type should be either script or addon, got \(type)"
+        case .changeTypeOfExisting:
+            return "Cannot change type of an existing item"
         }
     }
 }
@@ -57,7 +79,7 @@ public final class Validator {
         }
     }
 
-    public func validate(zipFilePath: String) throws -> ItemOperation {
+    public func validate(zipFilePath: String) async throws -> ItemOperation {
         let temporaryDirectoryPath = (NSTemporaryDirectory() as NSString).appendingPathComponent(UUID().uuidString)
         let fm = FileManager.default
         do {
@@ -84,15 +106,17 @@ public final class Validator {
                 let potentialPath = (basePath as NSString).appendingPathComponent(contents[0])
                 if fm.fileExists(atPath: potentialPath, isDirectory: &isDir), isDir.boolValue, contents[0] != "rich_description" {
                     basePath = potentialPath
+                } else {
+                    break
                 }
             } else {
                 break
             }
         }
-        return try validateDirectory(basePath)
+        return try await validateDirectory(basePath)
     }
 
-    private func validateDirectory(_ path: String) throws -> ItemOperation {
+    private func validateDirectory(_ path: String) async throws -> ItemOperation {
         let category = readString(directoryPath: path, filename: "category.txt")
         let idRequirement = readString(directoryPath: path, filename: "id_requirement.txt") ?? readString(directoryPath: path, filename: "id.txt")
         if let category, (category.isEmpty || category == "remove") {
@@ -112,10 +136,11 @@ public final class Validator {
         let title = readString(directoryPath: path, filename: "title.txt")
         let description = readString(directoryPath: path, filename: "description.txt")
         let potentialAddonPath = (path as NSString).appendingPathComponent("addon.zip")
-        let addonURL = FileManager.default.fileExists(atPath: potentialAddonPath) ? URL(fileURLWithPath: potentialAddonPath) : nil
+        let fm = FileManager.default
+        let addonURL = fm.fileExists(atPath: potentialAddonPath) ? URL(fileURLWithPath: potentialAddonPath) : nil
 
         let potentialCoverImagePath = (path as NSString).appendingPathComponent("cover_image.jpg")
-        let coverImageURL = FileManager.default.fileExists(atPath: potentialCoverImagePath) ? URL(fileURLWithPath: potentialCoverImagePath) : nil
+        let coverImageURL = fm.fileExists(atPath: potentialCoverImagePath) ? URL(fileURLWithPath: potentialCoverImagePath) : nil
 
         let modifyingExistingAddon: Bool
         if let idRequirement {
@@ -138,7 +163,7 @@ public final class Validator {
         var isDirectory: ObjCBool = false
         let richDescription: RichDescription?
         let removeRichDescription = readString(directoryPath: path, filename: "remove_rich_description.txt") == "remove"
-        if FileManager.default.fileExists(atPath: richDescriptionDirectory, isDirectory: &isDirectory), isDirectory.boolValue {
+        if fm.fileExists(atPath: richDescriptionDirectory, isDirectory: &isDirectory), isDirectory.boolValue {
             if removeRichDescription {
                 throw ValidatorError.richDescriptionRemovalConflict
             }
@@ -147,14 +172,14 @@ public final class Validator {
             let notes = readStringList(directoryPath: richDescriptionDirectory, filename: "notes.txt")
             let richCoverImagePath = (richDescriptionDirectory as NSString).appendingPathComponent("cover_image.jpg")
             let richCoverText = readString(directoryPath: richDescriptionDirectory, filename: "cover_image.txt")
-            guard FileManager.default.fileExists(atPath: richCoverImagePath) else {
+            guard fm.fileExists(atPath: richCoverImagePath) else {
                 throw ValidatorError.missingFields(fieldName: "rich_description/cover_image.jpg")
             }
             let youtubeIDs = readStringList(directoryPath: richDescriptionDirectory, filename: "youtube_ids.txt")
             var images = [Image]()
             while true {
                 let imagePath = (richDescriptionDirectory as NSString).appendingPathComponent("detail_image_\(images.count).jpg")
-                if !FileManager.default.fileExists(atPath: imagePath) {
+                if !fm.fileExists(atPath: imagePath) {
                     break
                 }
                 let caption = readString(directoryPath: richDescriptionDirectory, filename: "detail_image_\(images.count).txt")
@@ -193,7 +218,14 @@ public final class Validator {
             guard let addonURL else {
                 throw ValidatorError.missingFields(fieldName: "addon.zip")
             }
-            return .create(item: CreateItem(title: title, category: CKRecord.Reference(recordID: CKRecord.ID(recordName: category), action: .none), idRequirement: idRequirement, authors: authors, description: description, demoObjectName: demoObjectName, releaseDate: releaseDate, lastUpdateDate: lastUpdateDate, coverImage: coverImageURL, addon: addonURL, richDescription: richDescription, type: type, mainScriptName: mainScriptName))
+            guard let type, ["addon", "script"].contains(type) else {
+                throw ValidatorError.badType(type: type ?? "none")
+            }
+            let (relatedObjectPaths, needsUpdateRelatedObjectPaths) = try await validateAddonContents(location: .local(url: addonURL))
+            if let demoObjectName, !relatedObjectPaths.contains(demoObjectName) {
+                throw ValidatorError.badDemoObject(supportedPaths: relatedObjectPaths)
+            }
+            return .create(item: CreateItem(title: title, category: CKRecord.Reference(recordID: CKRecord.ID(recordName: category), action: .none), idRequirement: idRequirement, authors: authors, description: description, demoObjectName: demoObjectName, releaseDate: releaseDate, lastUpdateDate: lastUpdateDate, coverImage: coverImageURL, addon: addonURL, richDescription: richDescription, type: type, mainScriptName: mainScriptName, relatedObjectPaths: needsUpdateRelatedObjectPaths ? relatedObjectPaths : nil))
         }
         guard let idRequirement else {
             throw ValidatorError.missingFields(fieldName: "id_requirement.txt")
@@ -204,7 +236,96 @@ public final class Validator {
         } else {
             categoryReference = nil
         }
-        return .update(item: UpdateItem(title: title, category: categoryReference, id: CKRecord.ID(recordName: idRequirement), authors: authors, description: description, demoObjectName: demoObjectName, releaseDate: releaseDate, lastUpdateDate: lastUpdateDate, coverImage: coverImageURL, addon: addonURL, richDescription: richDescription, type: type, mainScriptName: mainScriptName, removeRichDescription: removeRichDescription))
+
+        guard type == nil || type == "none" else {
+            throw ValidatorError.changeTypeOfExisting
+        }
+
+        let relatedObjectPaths: [String]
+        let needsUpdateRelatedObjectPaths: Bool
+        if let addonURL {
+            (relatedObjectPaths, needsUpdateRelatedObjectPaths) = try await validateAddonContents(location: .local(url: addonURL))
+        } else {
+            (relatedObjectPaths, needsUpdateRelatedObjectPaths) = try await validateAddonContents(location: .remote(id: idRequirement))
+        }
+        if let demoObjectName, !relatedObjectPaths.contains(demoObjectName) {
+            throw ValidatorError.badDemoObject(supportedPaths: relatedObjectPaths)
+        }
+        return .update(item: UpdateItem(title: title, category: categoryReference, id: CKRecord.ID(recordName: idRequirement), authors: authors, description: description, demoObjectName: demoObjectName, releaseDate: releaseDate, lastUpdateDate: lastUpdateDate, coverImage: coverImageURL, addon: addonURL, richDescription: richDescription, mainScriptName: mainScriptName, removeRichDescription: removeRichDescription, relatedObjectPaths: needsUpdateRelatedObjectPaths ? relatedObjectPaths : nil))
+    }
+
+    private enum AddonLocation {
+        case local(url: URL)
+        case remote(id: String)
+    }
+
+    private func validateAddonContents(location: AddonLocation) async throws -> ([String], Bool) {
+        let addonURL: URL
+        switch location {
+        case let .local(url):
+            addonURL = url
+        case let .remote(id):
+            let db = CKContainer.default().publicCloudDatabase
+            let recordId = CKRecord.ID(recordName: id)
+            let recordResult: Result<CKRecord, Error>?
+            do {
+                recordResult = try await db.records(for: [recordId], desiredKeys: ["item", "relatedObjectPaths"])[recordId]
+            } catch {
+                throw ValidatorError.cloudKit(error: error)
+            }
+            guard let recordResult else {
+                throw ValidatorError.emptyResult
+            }
+            switch recordResult {
+            case let .success(record):
+                if let relatedObjectPaths = record["relatedObjectPaths"] as? [String] {
+                    return (relatedObjectPaths, false)
+                }
+
+                guard let addon = record["item"] as? CKAsset else {
+                    throw ValidatorError.incorrectRecordFieldType
+                }
+                do {
+                    let (url, _) = try await URLSession.shared.download(for: URLRequest(url: addon.fileURL))
+                    addonURL = url
+                } catch {
+                    throw ValidatorError.network
+                }
+            case let .failure(error):
+                throw ValidatorError.cloudKit(error: error)
+            }
+        }
+
+        let fm = FileManager.default
+        let temporaryDirectoryPath = (NSTemporaryDirectory() as NSString).appendingPathComponent(UUID().uuidString)
+        do {
+            try fm.unzipItem(at: addonURL, to: URL(fileURLWithPath: temporaryDirectoryPath))
+        } catch {
+            throw ValidatorError.unzipping
+        }
+
+        let targetExtensions: Set<String> = ["dsc", "stc", "ssc"]
+        guard let enumerator = fm.enumerator(atPath: temporaryDirectoryPath) else {
+            throw ValidatorError.fileManager
+        }
+        var catalogFiles = [String]()
+        while let relativePath = enumerator.nextObject() as? String {
+            let ext = (relativePath as NSString).pathExtension.lowercased()
+            if targetExtensions.contains(ext) {
+                catalogFiles.append((temporaryDirectoryPath as NSString).appendingPathComponent(relativePath))
+            }
+        }
+
+        var objectPaths = [String]()
+        for catalogFile in catalogFiles {
+            guard let data = fm.contents(atPath: catalogFile),
+                  let content = String(data: data, encoding: .utf8) else {
+                continue
+            }
+            objectPaths.append(contentsOf: CatalogObjectPathExtractor.extractObjectPaths(from: content).objectPaths)
+        }
+        let filtered = Array(Set(objectPaths))
+        return (filtered, filtered.count < 50)
     }
 
     public func validate(record: CKRecord) async throws -> ItemOperation {
@@ -313,12 +434,36 @@ public final class Validator {
             guard let addonURL else {
                 throw ValidatorError.missingFields(fieldName: "addon")
             }
-            return .create(item: CreateItem(title: title, category: category, idRequirement: idRequirement, authors: authors, description: description, demoObjectName: demoObjectName, releaseDate: releaseDate, lastUpdateDate: lastUpdateDate, coverImage: coverImageURL, addon: addonURL, richDescription: richDescription, type: type, mainScriptName: mainScriptName))
+            guard let type, ["addon", "script"].contains(type) else {
+                throw ValidatorError.badType(type: type ?? "none")
+            }
+            let (relatedObjectPaths, needsUpdateRelatedObjectPaths) = try await validateAddonContents(location: .local(url: addonURL))
+            if let demoObjectName, !relatedObjectPaths.contains(demoObjectName) {
+                throw ValidatorError.badDemoObject(supportedPaths: relatedObjectPaths)
+            }
+            return .create(item: CreateItem(title: title, category: category, idRequirement: idRequirement, authors: authors, description: description, demoObjectName: demoObjectName, releaseDate: releaseDate, lastUpdateDate: lastUpdateDate, coverImage: coverImageURL, addon: addonURL, richDescription: richDescription, type: type, mainScriptName: mainScriptName, relatedObjectPaths: needsUpdateRelatedObjectPaths ? relatedObjectPaths : nil))
         }
         guard let idRequirement else {
             throw ValidatorError.missingFields(fieldName: "id_requirement")
         }
-        return .update(item: UpdateItem(title: title, category: category, id: CKRecord.ID(recordName: idRequirement), authors: authors, description: description, demoObjectName: demoObjectName, releaseDate: releaseDate, lastUpdateDate: lastUpdateDate, coverImage: coverImageURL, addon: addonURL, richDescription: richDescription, type: type, mainScriptName: mainScriptName, removeRichDescription: removeRichDescription))
+
+        guard type == nil || type == "none" else {
+            throw ValidatorError.changeTypeOfExisting
+        }
+
+        let relatedObjectPaths: [String]
+        let needsUpdateRelatedObjectPaths: Bool
+        if let addonURL {
+            (relatedObjectPaths, needsUpdateRelatedObjectPaths) = try await validateAddonContents(location: .local(url: addonURL))
+        } else {
+            (relatedObjectPaths, needsUpdateRelatedObjectPaths) = try await validateAddonContents(location: .remote(id: idRequirement))
+        }
+
+        if let demoObjectName, !relatedObjectPaths.contains(demoObjectName) {
+            throw ValidatorError.badDemoObject(supportedPaths: relatedObjectPaths)
+        }
+
+        return .update(item: UpdateItem(title: title, category: category, id: CKRecord.ID(recordName: idRequirement), authors: authors, description: description, demoObjectName: demoObjectName, releaseDate: releaseDate, lastUpdateDate: lastUpdateDate, coverImage: coverImageURL, addon: addonURL, richDescription: richDescription, mainScriptName: mainScriptName, removeRichDescription: removeRichDescription, relatedObjectPaths: needsUpdateRelatedObjectPaths ? relatedObjectPaths : nil))
     }
 }
 
