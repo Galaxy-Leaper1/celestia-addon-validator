@@ -42,5 +42,15 @@ let package = Package(
                 .target(name: "CelestiaCatalogParser"),
             ]
         ),
+        .executableTarget(
+            name: "CelestiaWorkshopSyncApp",
+            dependencies: [
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+                .product(name: "OpenCloudKit", package: "OpenCloudKit"),
+                .product(name: "CloudKitCodable", package: "OpenCloudKit"),
+                .product(name: "ZIPFoundation", package: "ZIPFoundation"),
+                .target(name: "CelestiaAddonValidator"),
+            ]
+        ),
     ]
 )
