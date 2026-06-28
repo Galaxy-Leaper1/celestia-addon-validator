@@ -60,14 +60,17 @@ struct CelestiaWorkshopSyncApp: AsyncParsableCommand {
         }
         CloudKit.shared.configure(with: CKConfig(containers: [config]))
 
-        let coordinator = SyncCoordinator(
-            stateDir: URL(fileURLWithPath: stateDir),
-            steamcmdPath: URL(fileURLWithPath: steamcmdPath),
-            appID: appID,
-            steamUsername: steamUsername,
-            dryRun: dryRun,
-            limit: limit
-        )
-        try await coordinator.run()
+        try await withHTTPClient { httpClient in
+            let coordinator = SyncCoordinator(
+                stateDir: URL(fileURLWithPath: stateDir),
+                steamcmdPath: URL(fileURLWithPath: steamcmdPath),
+                appID: appID,
+                steamUsername: steamUsername,
+                dryRun: dryRun,
+                httpClient: httpClient,
+                limit: limit
+            )
+            try await coordinator.run()
+        }
     }
 }
